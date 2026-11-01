@@ -20,7 +20,8 @@ from database import (
     reset_database, log_activity
 )
 from engine import (
-    extract_text_from_pdf, parse_resume, evaluate_candidate
+    extract_text_from_pdf, parse_resume, evaluate_candidate,
+    calculate_experience_breakdown, extract_certifications
 )
 from generate_samples import generate_all_samples, SAMPLE_DIR
 
@@ -166,6 +167,37 @@ ENTERPRISE_CSS = """
         border-radius: 12px !important;
         padding: 14px !important;
         margin-bottom: 18px !important;
+    }
+    /* Benchmark Specs: stronger contrast on the dark sidebar */
+    .sidebar-job-card .benchmark-label {
+        color: #cbd5e1 !important;
+        font-size: 11px !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.06em !important;
+        text-transform: uppercase !important;
+        margin-bottom: 5px !important;
+    }
+    .sidebar-job-card .benchmark-title {
+        color: #ffffff !important;
+        font-size: 13px !important;
+        font-weight: 700 !important;
+        line-height: 1.4 !important;
+    }
+    .sidebar-job-card .benchmark-exp {
+        color: #cbd5e1 !important;
+        font-size: 11px !important;
+        margin: 5px 0 8px !important;
+    }
+    .sidebar-job-card .benchmark-exp strong {
+        color: #ffffff !important;
+    }
+    /* Sidebar skill chips: override the broad sidebar text colour rule. */
+    [data-testid="stSidebarContent"] .sidebar-job-card .skill-chip.skill-chip-matched {
+        color: #1d4ed8 !important;
+        background-color: #eff6ff !important;
+        border: 1px solid #bfdbfe !important;
+        font-weight: 700 !important;
+        opacity: 1 !important;
     }
 
     /* 3. Top Greeting Banner */
@@ -442,9 +474,9 @@ with st.sidebar:
             req_pills = "".join([f"<span class='skill-chip skill-chip-matched' style='font-size:10px;padding:2px 6px;'>{s}</span>" for s in active_job['required_skills'][:3]])
             st.markdown(f"""
             <div class="sidebar-job-card">
-                <div style="font-size:11px;font-weight:700;color:#94a3b8;text-transform:uppercase;margin-bottom:4px;">Benchmark Specs</div>
-                <div style="font-size:13px;font-weight:700;color:#ffffff;">{active_job['title']}</div>
-                <div style="font-size:11px;color:#94a3b8;margin-bottom:6px;">Min Exp: <strong style="color:#e2e8f0;">{active_job['min_experience']} yrs</strong></div>
+                <div class="benchmark-label">Benchmark Specs</div>
+                <div class="benchmark-title">{active_job['title']}</div>
+                <div class="benchmark-exp">Min Exp: <strong>{active_job['min_experience']} yrs</strong></div>
                 <div>{req_pills}</div>
             </div>
             """, unsafe_allow_html=True)
@@ -1121,30 +1153,69 @@ elif nav_selection == "👥 Candidates":
             </div>
             """)
 
-            # Card Action Buttons
-            btn_col1, btn_col2, btn_col3, btn_col4, _ = st.columns([1.5, 1.2, 1.2, 1.2, 3])
+            # Full-width candidate dossier (kept separate from action-button columns).
+            with st.expander("🔍 View Complete Dossier", expanded=False):
+                raw_resume_text = m.get("raw_text") or ""
+                if raw_resume_text.strip():
+                    experience_breakdown = calculate_experience_breakdown(raw_resume_text)
+                    dossier_certifications = extract_certifications(raw_resume_text)
+                else:
+                    experience_breakdown = {
+                        "full_time_experience_years": float(m.get("experience_years", 0.0)),
+                        "internship_experience_years": 0.0,
+                        "experience_years": float(m.get("experience_years", 0.0)),
+                    }
+                    dossier_certifications = m.get("certifications") or "Not detected"
+
+                st.markdown(f"### Candidate Dossier — {m['name']}")
+                exp_full, exp_intern, exp_total = st.columns(3)
+                exp_full.metric("Full-time experience", f"{experience_breakdown['full_time_experience_years']:.2f} yrs")
+                exp_intern.metric("Internship experience", f"{experience_breakdown['internship_experience_years']:.2f} yrs")
+                exp_total.metric("Total relevant experience", f"{experience_breakdown['experience_years']:.2f} yrs")
+
+                dossier_left, dossier_right = st.columns(2, gap="large")
+                with dossier_left:
+                    st.markdown("#### Education")
+                    st.write(m.get("education") or "Not detected")
+                    st.markdown("#### Certifications")
+                    st.write(dossier_certifications)
+                with dossier_right:
+                    st.markdown("#### Key Projects")
+                    st.write(m.get("projects") or "Not detected")
+                    st.markdown("#### Technical Skills")
+                    candidate_skills = m.get("skills") or []
+                    st.write(", ".join(candidate_skills) if candidate_skills else "Not detected")
+
+                st.divider()
+                strengths_col, evaluation_col = st.columns(2, gap="large")
+                with strengths_col:
+                    st.markdown("#### Candidate Strengths")
+                    if m.get("strengths"):
+                        for s_item in m["strengths"]:
+                            st.markdown(f"- <span style='color:#15803d;font-weight:600;'>{s_item}</span>", unsafe_allow_html=True)
+                    else:
+                        st.caption("No strengths were identified by the current rules.")
+                with evaluation_col:
+                    st.markdown("#### Areas for Recruiter Evaluation")
+                    if m.get("areas_for_evaluation"):
+                        for a_item in m["areas_for_evaluation"]:
+                            st.markdown(f"- <span style='color:#b91c1c;font-weight:600;'>{a_item}</span>", unsafe_allow_html=True)
+                    else:
+                        st.caption("No additional evaluation areas were flagged.")
+
+            # Recruiter actions stay in their own compact row beneath the dossier.
+            btn_col1, btn_col2, btn_col3, _ = st.columns([1.25, 1.25, 1.25, 4.25])
             with btn_col1:
-                with st.expander("🔍 View Complete Dossier"):
-                    st.markdown(f"**Education:** {m['education']}")
-                    st.markdown(f"**Certifications:** {m['certifications']}")
-                    st.markdown(f"**Key Projects:** {m['projects']}")
-                    st.markdown("**Candidate Strengths:**")
-                    for s_item in m['strengths']:
-                        st.markdown(f"- <span style='color:#15803d;font-weight:500;'>{s_item}</span>", unsafe_allow_html=True)
-                    st.markdown("**Areas for Recruiter Evaluation:**")
-                    for a_item in m['areas_for_evaluation']:
-                        st.markdown(f"- <span style='color:#b91c1c;font-weight:500;'>{a_item}</span>", unsafe_allow_html=True)
-            with btn_col2:
                 if status != "Shortlisted":
                     if st.button("⭐ Shortlist", key=f"sl_{m['candidate_id']}_{m['job_id']}", use_container_width=True):
                         update_candidate_status(active_job["id"], m["candidate_id"], "Shortlisted")
                         st.rerun()
-            with btn_col3:
+            with btn_col2:
                 if status != "Interview":
                     if st.button("💬 Interview", key=f"iv_{m['candidate_id']}_{m['job_id']}", use_container_width=True):
                         update_candidate_status(active_job["id"], m["candidate_id"], "Interview")
                         st.rerun()
-            with btn_col4:
+            with btn_col3:
                 if status != "Rejected":
                     if st.button("❌ Reject", key=f"rj_{m['candidate_id']}_{m['job_id']}", use_container_width=True):
                         update_candidate_status(active_job["id"], m["candidate_id"], "Rejected")

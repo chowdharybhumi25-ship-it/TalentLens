@@ -7,6 +7,7 @@ and explainable candidate matching via TF-IDF, Cosine Similarity, and skill scor
 import re
 import io
 import json
+from datetime import datetime
 import pymupdf  # Modern PyMuPDF API
 from typing import Dict, List, Tuple, Any, Optional
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -64,6 +65,248 @@ def extract_text_from_pdf(file_source: Any) -> str:
         return ""
 
 
+
+def _parse_resume_date(value: str):
+    """Convert a resume date token into a (year, month) pair."""
+    value = value.strip().lower()
+    if value in {"present", "current", "now"}:
+        now = datetime.now()
+        return now.year, now.month
+
+    month_names = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2,
+        "mar": 3, "march": 3, "apr": 4, "april": 4,
+        "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10, "nov": 11, "november": 11,
+        "dec": 12, "december": 12,
+    }
+    month_match = re.fullmatch(
+        r"([a-zA-Z]+)[\s,./-]+(19\d{2}|20\d{2})", value
+    )
+    if month_match and month_match.group(1).lower() in month_names:
+        return int(month_match.group(2)), month_names[month_match.group(1).lower()]
+
+    numeric_match = re.fullmatch(r"(0?[1-9]|1[0-2])[/.-](19\d{2}|20\d{2})", value)
+    if numeric_match:
+        return int(numeric_match.group(2)), int(numeric_match.group(1))
+
+    year_match = re.fullmatch(r"(19\d{2}|20\d{2})", value)
+    if year_match:
+        return int(year_match.group(1)), 1
+    return None
+
+
+def _merge_month_intervals(intervals: List[Tuple[int, int]]) -> int:
+    """Return the number of unique months covered by possibly-overlapping intervals."""
+    if not intervals:
+        return 0
+    intervals = sorted(intervals)
+    merged = []
+    for start, end in intervals:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return sum(end - start for start, end in merged)
+
+
+def _calculate_experience_breakdown(resume_text: str) -> Dict[str, float]:
+    """Calculate full-time, internship, and unique total experience from resume sections.
+
+    Dates are only counted while inside employment/internship sections. Overlapping
+    periods are merged for the total, so concurrent roles are not double-counted.
+    """
+    lines = [line.strip() for line in (resume_text or '').splitlines() if line.strip()]
+
+    internship_heading = re.compile(
+        r"^(?:internships?|summer internships?|industrial training|"
+        r"internship experience|training experience)$", re.IGNORECASE
+    )
+    employment_heading = re.compile(
+        r"^(?:(?:professional|work|employment)\s+)?experience(?:\s+history)?$|"
+        r"^employment history$|^work history$|^professional experience$|^full[- ]time experience$",
+        re.IGNORECASE,
+    )
+    other_heading = re.compile(
+        r"^(?:education|academic background|projects?|technical skills|skills|"
+        r"certifications?|licenses|achievements|publications|interests|hobbies|"
+        r"references|additional information)$", re.IGNORECASE
+    )
+
+    month_names = (
+        r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|"
+        r"Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|"
+        r"Nov(?:ember)?|Dec(?:ember)?"
+    )
+    month_year = rf"(?:{month_names})[\s,./-]+(?:19\d{{2}}|20\d{{2}})"
+    numeric_month_year = r"(?:0?[1-9]|1[0-2])[/.-](?:19\d{2}|20\d{2})"
+    year_only = r"(?:19\d{2}|20\d{2})"
+    date_token = rf"(?:{month_year}|{numeric_month_year}|{year_only}|present|current|now)"
+    range_pattern = re.compile(
+        rf"(?<![A-Za-z0-9])({date_token})\s*(?:-|–|—|to|through)\s*({date_token})(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+
+    internship_intervals: List[Tuple[int, int]] = []
+    full_time_intervals: List[Tuple[int, int]] = []
+    section_kind: Optional[str] = None
+    current_role_kind: Optional[str] = None
+
+    for line in lines:
+        heading = re.sub(r"^[\s•●▪*-]+", "", line).strip().rstrip(":").strip()
+        heading = re.sub(r"\s+", " ", heading)
+
+        if internship_heading.fullmatch(heading):
+            section_kind = "internship"
+            current_role_kind = "internship"
+            continue
+        if employment_heading.fullmatch(heading):
+            section_kind = "employment"
+            current_role_kind = "full_time"
+            continue
+        if other_heading.fullmatch(heading):
+            section_kind = None
+            current_role_kind = None
+            continue
+
+        if section_kind is None:
+            continue
+
+        if re.search(r"\b(intern(?:ship)?s?|trainee|industrial training)\b", line, re.IGNORECASE):
+            current_role_kind = "internship"
+        elif section_kind == "employment" and re.search(
+            r"\b(full[- ]?time|engineer|developer|analyst|consultant|manager|"
+            r"associate|specialist|architect|designer|administrator|scientist|lead)\b",
+            line, re.IGNORECASE,
+        ) and not re.search(r"\b(intern|trainee)\b", line, re.IGNORECASE):
+            current_role_kind = "full_time"
+
+        for match in range_pattern.finditer(line):
+            start_date = _parse_resume_date(match.group(1))
+            end_date = _parse_resume_date(match.group(2))
+            if not start_date or not end_date:
+                continue
+
+            start_index = start_date[0] * 12 + start_date[1]
+            end_index = end_date[0] * 12 + end_date[1]
+            both_year_only = bool(
+                re.fullmatch(r"(?:19|20)\d{2}", match.group(1).strip())
+                and re.fullmatch(r"(?:19|20)\d{2}", match.group(2).strip())
+            )
+            # A month-specific end date includes that month; year-only ranges
+            # use year-difference semantics (e.g. 2022–2023 = one year).
+            if not both_year_only:
+                end_index += 1
+            if end_index < start_index or end_index - start_index > 40 * 12:
+                continue
+
+            role_kind = "internship" if (
+                section_kind == "internship" or current_role_kind == "internship"
+            ) else "full_time"
+            target = internship_intervals if role_kind == "internship" else full_time_intervals
+            target.append((start_index, end_index))
+
+    # If no date ranges were found, allow clearly-labelled duration statements
+    # within employment sections (e.g. "6 months internship experience").
+    if not internship_intervals and not full_time_intervals:
+        section_kind = None
+        current_role_kind = None
+        duration_pattern = re.compile(
+            r"(?P<amount>\d+(?:\.\d+)?)\s*(?P<unit>years?|yrs?|months?|mos?)\b",
+            re.IGNORECASE,
+        )
+        internship_durations = []
+        full_time_durations = []
+        for line in lines:
+            heading = re.sub(r"^[\s•●▪*-]+", "", line).strip().rstrip(":").strip()
+            if internship_heading.fullmatch(heading):
+                section_kind, current_role_kind = "internship", "internship"
+                continue
+            if employment_heading.fullmatch(heading):
+                section_kind, current_role_kind = "employment", "full_time"
+                continue
+            if other_heading.fullmatch(heading):
+                section_kind, current_role_kind = None, None
+                continue
+            if section_kind is None:
+                continue
+            if re.search(r"\b(intern(?:ship)?s?|trainee|industrial training)\b", line, re.IGNORECASE):
+                current_role_kind = "internship"
+            for match in duration_pattern.finditer(line):
+                amount = float(match.group("amount"))
+                unit = match.group("unit").lower()
+                years = amount / 12.0 if unit.startswith(("month", "mo")) else amount
+                if not 0 < years <= 40:
+                    continue
+                is_internship = (
+                    section_kind == "internship" or current_role_kind == "internship"
+                    or bool(re.search(r"\b(intern|internship|trainee)\b", line, re.IGNORECASE))
+                )
+                (internship_durations if is_internship else full_time_durations).append(years)
+        internship_years = max(internship_durations, default=0.0)
+        full_time_years = max(full_time_durations, default=0.0)
+        return {
+            "full_time_experience_years": round(full_time_years, 2),
+            "internship_experience_years": round(internship_years, 2),
+            "experience_years": round(full_time_years + internship_years, 2),
+        }
+
+    full_time_months = _merge_month_intervals(full_time_intervals)
+    internship_months = _merge_month_intervals(internship_intervals)
+    total_months = _merge_month_intervals(full_time_intervals + internship_intervals)
+    return {
+        "full_time_experience_years": round(full_time_months / 12.0, 2),
+        "internship_experience_years": round(internship_months / 12.0, 2),
+        "experience_years": round(total_months / 12.0, 2),
+    }
+
+
+def calculate_experience_breakdown(resume_text: str) -> Dict[str, float]:
+    """Public helper used by the recruiter dossier to show the experience split."""
+    return _calculate_experience_breakdown(resume_text)
+
+
+def _calculate_experience_years(resume_text: str) -> float:
+    """Backward-compatible total experience helper."""
+    return _calculate_experience_breakdown(resume_text)["experience_years"]
+
+
+def extract_certifications(raw_text: str) -> str:
+    """Extract certifications from the Certifications section without inventing defaults."""
+    lines = [line.strip() for line in (raw_text or "").splitlines() if line.strip()]
+    cert_heading = re.compile(r"^(?:professional )?certifications?|licenses? and certifications?$", re.I)
+    section_heading = re.compile(
+        r"^(?:education|academic background|projects?|technical skills|skills|"
+        r"experience|professional experience|work experience|internships?|"
+        r"additional information|achievements|publications|interests|hobbies|references)$",
+        re.I,
+    )
+    collected = []
+    in_cert_section = False
+    for line in lines:
+        cleaned = re.sub(r"^[\s•●▪*-]+", "", line).strip()
+        normalized = cleaned.rstrip(":").strip()
+        if cert_heading.fullmatch(normalized):
+            in_cert_section = True
+            continue
+        if section_heading.fullmatch(normalized):
+            in_cert_section = False
+            continue
+        if in_cert_section and len(cleaned) > 2:
+            collected.append(cleaned)
+
+    # Some resumes list a certification outside a dedicated section. Only use
+    # lines explicitly mentioning a certificate/certification; never invent one.
+    if not collected:
+        collected = [
+            re.sub(r"^[\s•●▪*-]+", "", line).strip()
+            for line in lines
+            if re.search(r"\b(certified|certification|certificate)\b", line, re.I)
+        ]
+    return " | ".join(collected[:6]) if collected else "Not detected"
+
+
 def parse_resume(raw_text: str, filename: str = "Candidate_Resume.pdf") -> Dict[str, Any]:
     """
     Extract key structured candidate entities from raw resume text:
@@ -84,9 +327,11 @@ def parse_resume(raw_text: str, filename: str = "Candidate_Resume.pdf") -> Dict[
             "phone": "",
             "skills": [],
             "experience_years": 0.0,
-            "education": "Not found (Empty document)",
-            "projects": "Not found",
-            "certifications": "None",
+            "full_time_experience_years": 0.0,
+            "internship_experience_years": 0.0,
+            "education": "Not detected",
+            "projects": "Not detected",
+            "certifications": "Not detected",
             "raw_text": ""
         }
 
@@ -120,26 +365,11 @@ def parse_resume(raw_text: str, filename: str = "Candidate_Resume.pdf") -> Dict[
         clean_name = re.sub(r'[\._-]|resume|cv|\.pdf', ' ', filename, flags=re.IGNORECASE).strip().title()
         name = clean_name if clean_name else "Candidate"
 
-    # 4. Experience calculation
-    experience_years = 0.0
-    # Direct mentions like "4+ years of experience", "3 years experience", "5.5 yrs exp"
-    exp_matches = re.findall(r'(\d+(?:\.\d+)?)\s*(?:\+)?\s*(?:years?|yrs?)(?:\s+(?:of\s+)?experience)?', raw_text, re.IGNORECASE)
-    if exp_matches:
-        try:
-            # Take the most prominent/highest realistic experience mention <= 40
-            valid_exps = [float(e) for e in exp_matches if 0.5 <= float(e) <= 40]
-            if valid_exps:
-                experience_years = max(valid_exps)
-        except Exception:
-            experience_years = 1.0
-
-    # Fallback to date range detection if no explicit years found
-    if experience_years == 0.0:
-        date_years = [int(y) for y in re.findall(r'\b(20\d{2}|19\d{2})\b', raw_text)]
-        if len(date_years) >= 2:
-            span = max(date_years) - min(date_years)
-            if 1 <= span <= 25:
-                experience_years = float(span)
+    # 4. Work and internship experience calculation.
+    # Only employment/internship sections and explicitly labelled work durations
+    # contribute; education and project dates are not treated as work experience.
+    experience_breakdown = _calculate_experience_breakdown(raw_text)
+    experience_years = experience_breakdown["experience_years"]
 
     # 5. Technical Skills Extraction
     extracted_skills = []
@@ -168,7 +398,7 @@ def parse_resume(raw_text: str, filename: str = "Candidate_Resume.pdf") -> Dict[
             education_lines.append(line)
             if len(education_lines) >= 3:
                 break
-    education = " | ".join(education_lines) if education_lines else "Bachelor of Science / Technology in Computer Science (or equivalent)"
+    education = " | ".join(education_lines) if education_lines else "Not detected"
 
     # 7. Projects Extraction
     project_lines = []
@@ -186,18 +416,19 @@ def parse_resume(raw_text: str, filename: str = "Candidate_Resume.pdf") -> Dict[
                 project_lines.append(line)
             if len(project_lines) >= 4:
                 break
-    projects = " \n ".join(project_lines) if project_lines else "Enterprise Applications, Backend Microservices & API Development"
+    projects = " \n ".join(project_lines) if project_lines else "Not detected"
 
-    # 8. Certifications
-    cert_matches = re.findall(r'(?:certified|certification|certificate)[\w\s:-]{3,50}', raw_text, re.IGNORECASE)
-    certifications = ", ".join(cert_matches[:3]) if cert_matches else "AWS Certified Cloud Practitioner, Python Professional"
+    # 8. Certifications: use explicit section content; never invent credentials.
+    certifications = extract_certifications(raw_text)
 
     return {
         "name": name,
-        "email": email if email else f"{name.lower().replace(' ', '.')}@example.com",
-        "phone": phone if phone else "+1 (555) 019-2834",
+        "email": email,
+        "phone": phone,
         "skills": extracted_skills,
         "experience_years": experience_years,
+        "full_time_experience_years": experience_breakdown["full_time_experience_years"],
+        "internship_experience_years": experience_breakdown["internship_experience_years"],
         "education": education,
         "projects": projects,
         "certifications": certifications,
