@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+*.log
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Node / Frontend
+node_modules/
+dist/
+.cache/
+*.tsbuildinfo
+
+# Database
+*.db
+*.sqlite3
+
+# Uploads
+backend/uploads/
+backend/resumes/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+# TalentLens local data
+/sample_resumes/
+/uploads/
